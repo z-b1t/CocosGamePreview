@@ -1,0 +1,28 @@
+<div class="camera-preview">
+    <header class="toolbar">
+        <div class="row">
+            <span class="label" id="labelCamera"></span>
+            <ui-select id="cameraSelect" class="grow"></ui-select>
+            <ui-button id="refreshButton"></ui-button>
+        </div>
+        <div class="row">
+            <span class="label" id="labelResolution"></span>
+            <ui-select id="deviceSelect" class="grow"></ui-select>
+            <ui-button id="rotateButton"></ui-button>
+        </div>
+        <div class="row">
+            <ui-checkbox id="modeCheckbox"></ui-checkbox>
+            <span class="label" id="labelMode"></span>
+            <span class="spacer"></span>
+            <span class="label" id="labelFps"></span>
+            <ui-select id="fpsSelect"></ui-select>
+        </div>
+    </header>
+    <section class="stage">
+        <img class="preview" id="preview" />
+        <div class="placeholder" id="placeholder"></div>
+    </section>
+    <footer class="status">
+        <span id="status"></span>
+    </footer>
+</div>

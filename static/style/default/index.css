@@ -1,0 +1,88 @@
+:host {
+    display: flex;
+    height: 100%;
+    overflow: hidden;
+}
+
+.camera-preview {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+}
+
+.toolbar {
+    flex: none;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--color-normal-border);
+}
+
+.toolbar .row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 4px;
+}
+
+.toolbar .row:last-child {
+    margin-bottom: 0;
+}
+
+.toolbar .label {
+    flex: none;
+    color: var(--color-normal-contrast-weakest);
+    white-space: nowrap;
+}
+
+.toolbar .grow {
+    flex: 1;
+    min-width: 0;
+}
+
+.toolbar .spacer {
+    flex: 1;
+}
+
+/* 预览区：图片始终以 contain 的方式适配，任何面板尺寸下都保持分辨率比例完整，不裁切不拉伸 */
+.stage {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    padding: 8px;
+    background-color: var(--color-normal-fill-emphasis);
+}
+
+.stage .preview {
+    display: block;
+    visibility: hidden;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    object-position: center;
+}
+
+.stage .placeholder {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 12px;
+    color: var(--color-normal-contrast-weakest);
+    text-align: center;
+    pointer-events: none;
+}
+
+.status {
+    flex: none;
+    padding: 4px 8px;
+    border-top: 1px solid var(--color-normal-border);
+    color: var(--color-normal-contrast-weakest);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}

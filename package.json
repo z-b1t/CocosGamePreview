@@ -1,0 +1,51 @@
+{
+    "$schema": "./@types/schema/package/index.json",
+    "package_version": 2,
+    "name": "camera-preview",
+    "version": "1.0.0",
+    "author": "z",
+    "editor": ">=3.8.8",
+    "scripts": {
+        "preinstall": "node ./scripts/preinstall.js",
+        "build": "npx tsc"
+    },
+    "description": "i18n:camera-preview.description",
+    "main": "./dist/main.js",
+    "devDependencies": {
+        "@cocos/creator-types": "^3.8.8",
+        "@types/node": "^18.17.1",
+        "typescript": "^5.8.2"
+    },
+    "panels": {
+        "default": {
+            "title": "i18n:camera-preview.panel_title",
+            "type": "dockable",
+            "main": "dist/panels/default",
+            "size": {
+                "min-width": 320,
+                "min-height": 260,
+                "width": 480,
+                "height": 720
+            }
+        }
+    },
+    "contributions": {
+        "menu": [
+            {
+                "path": "i18n:menu.panel",
+                "label": "i18n:camera-preview.panel_title",
+                "message": "open-panel"
+            }
+        ],
+        "messages": {
+            "open-panel": {
+                "methods": [
+                    "openPanel"
+                ]
+            }
+        },
+        "scene": {
+            "script": "./dist/scene.js"
+        }
+    }
+}

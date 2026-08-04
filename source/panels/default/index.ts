@@ -81,10 +81,17 @@ class CameraPreviewPanel {
     private devices: IDeviceItem[] = [];
     private cameras: ICameraInfo[] = [];
     private visible = true;
+    private sceneReady = false;
     private capturing = false;
     private captureTimer = 0;
     private cameraTimer = 0;
     private stopVersion = 0;
+    private readonly onSceneReady = (): void => {
+        this.handleSceneReady();
+    };
+    private readonly onSceneClose = (): void => {
+        this.handleSceneClose();
+    };
 
     constructor(elements: Record<string, any>) {
         this.$ = elements;
@@ -93,26 +100,28 @@ class CameraPreviewPanel {
     async init(): Promise<void> {
         this.applyTexts();
         this.bindEvents();
+        const message = Editor.Message as any;
+        message.addBroadcastListener('scene:ready', this.onSceneReady);
+        message.addBroadcastListener('scene:close', this.onSceneClose);
         await this.loadSettings();
         this.fillFixedSelects();
         await this.refreshDevices();
-        await this.refreshCameras();
         this.syncControls();
-        this.restartCaptureTimer();
-        this.cameraTimer = window.setInterval(() => {
-            if (this.visible) {
-                void this.refreshCameras();
-            }
-        }, CAMERA_REFRESH_INTERVAL);
-        void this.capture();
+        // 面板可能在场景已就绪后才打开，广播已经错过，主动探测一次
+        if (await this.probeSceneReady()) {
+            this.handleSceneReady();
+        } else {
+            this.showPlaceholder(translate('waiting_scene'));
+        }
     }
 
     dispose(): void {
         this.visible = false;
-        window.clearInterval(this.captureTimer);
-        window.clearInterval(this.cameraTimer);
-        this.captureTimer = 0;
-        this.cameraTimer = 0;
+        this.sceneReady = false;
+        const message = Editor.Message as any;
+        message.removeBroadcastListener('scene:ready', this.onSceneReady);
+        message.removeBroadcastListener('scene:close', this.onSceneClose);
+        this.stopPreviewTimers();
         void this.stopScene();
     }
 
@@ -120,22 +129,76 @@ class CameraPreviewPanel {
         this.visible = visible;
         if (visible) {
             this.stopVersion++;
-            void this.refreshCameras();
-            void this.capture();
+            if (this.sceneReady) {
+                void this.refreshCameras();
+                void this.capture();
+            } else {
+                this.showPlaceholder(translate('waiting_scene'));
+            }
         } else {
             void this.stopScene();
         }
     }
 
+    private handleSceneReady(): void {
+        this.sceneReady = true;
+        if (!this.visible) {
+            return;
+        }
+        void this.refreshCameras();
+        this.restartPreviewTimers();
+        void this.capture();
+    }
+
+    private handleSceneClose(): void {
+        this.sceneReady = false;
+        this.stopPreviewTimers();
+        this.cameras = [];
+        if (this.visible) {
+            this.showPlaceholder(translate('waiting_scene'));
+        }
+        void this.stopScene(true);
+    }
+
+    private async probeSceneReady(): Promise<boolean> {
+        try {
+            await this.executeSceneScript('queryCameras', []);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    private restartPreviewTimers(): void {
+        this.restartCaptureTimer();
+        window.clearInterval(this.cameraTimer);
+        this.cameraTimer = window.setInterval(() => {
+            if (this.visible && this.sceneReady) {
+                void this.refreshCameras();
+            }
+        }, CAMERA_REFRESH_INTERVAL);
+    }
+
+    private stopPreviewTimers(): void {
+        window.clearInterval(this.captureTimer);
+        window.clearInterval(this.cameraTimer);
+        this.captureTimer = 0;
+        this.cameraTimer = 0;
+    }
+
     /**
      * @zh 通知场景进程把相机从预览窗口上摘回去，不预览时不占用任何渲染开销
      */
-    private async stopScene(): Promise<void> {
+    private async stopScene(force = false): Promise<void> {
         const stopVersion = ++this.stopVersion;
         while (this.capturing) {
             await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
         }
-        if (stopVersion !== this.stopVersion || this.visible) {
+        if (stopVersion !== this.stopVersion) {
+            return;
+        }
+        // 面板仍可见时默认不 stop（还会继续预览）；场景关闭时强制摘回
+        if (!force && this.visible) {
             return;
         }
         await this.executeSceneScript('stop', []).catch(() => {});
@@ -242,6 +305,9 @@ class CameraPreviewPanel {
     }
 
     private async refreshCameras(): Promise<void> {
+        if (!this.sceneReady) {
+            return;
+        }
         let cameras: ICameraInfo[] = [];
         try {
             cameras = await this.executeSceneScript<ICameraInfo[]>('queryCameras', []);
@@ -312,7 +378,7 @@ class CameraPreviewPanel {
     }
 
     private async capture(): Promise<void> {
-        if (!this.visible || this.capturing) {
+        if (!this.visible || !this.sceneReady || this.capturing) {
             return;
         }
         const resolution = this.currentResolution();

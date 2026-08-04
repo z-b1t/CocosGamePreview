@@ -11,6 +11,7 @@ module.exports = {
     refresh: 'Refresh',
     rotate: 'Rotate',
     loading: 'Loading preview...',
+    waiting_scene: 'Waiting for scene...',
     no_camera: 'No camera available in the current scene',
     disabled: 'disabled',
 };

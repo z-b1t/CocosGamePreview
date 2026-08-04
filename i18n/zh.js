@@ -11,6 +11,7 @@ module.exports = {
     refresh: '刷新',
     rotate: '横竖屏',
     loading: '正在加载预览……',
+    waiting_scene: '等待场景就绪……',
     no_camera: '当前场景中没有可预览的相机',
     disabled: '未启用',
 };

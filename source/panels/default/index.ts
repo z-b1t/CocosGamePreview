@@ -22,6 +22,179 @@ const FPS_OPTIONS = [1, 5, 10, 15, 30];
 const RENDER_LIMIT = 1080;
 const CAPTURE_QUALITY = 0.8;
 const CAMERA_REFRESH_INTERVAL = 2000;
+const MINI_PREVIEW_HIDE_STYLE_ID = 'camera-preview-hide-editor-mini-style';
+const MINI_PREVIEW_HIDE_INTERVAL = 250;
+/** 编辑器小窗：.float-window 内的 .camera-preview；本扩展面板根节点是 game-preview-panel，不会被匹配。 */
+const EDITOR_MINI_SELECTORS = ['.float-window[camera]', '.float-window .camera-preview'];
+const MINI_PREVIEW_CSS = `
+.float-window[camera],
+.float-window:has(.camera-preview) {
+    display: none !important;
+    visibility: hidden !important;
+    opacity: 0 !important;
+    pointer-events: none !important;
+}
+.float-window .camera-preview {
+    display: none !important;
+    visibility: hidden !important;
+}
+`;
+
+function getCandidateDocuments(): Document[] {
+    const docs: Document[] = [];
+    const add = (doc: Document | null | undefined) => {
+        if (doc && !docs.includes(doc)) {
+            docs.push(doc);
+        }
+    };
+    try {
+        add(globalThis.document);
+    } catch {
+        // ignore
+    }
+    try {
+        add((globalThis as any).parent?.document);
+    } catch {
+        // ignore
+    }
+    try {
+        add((globalThis as any).top?.document);
+    } catch {
+        // ignore
+    }
+    return docs;
+}
+
+function injectHideStyle(doc: Document): void {
+    let style = doc.getElementById(MINI_PREVIEW_HIDE_STYLE_ID) as HTMLStyleElement | null;
+    if (!style) {
+        style = doc.createElement('style');
+        style.id = MINI_PREVIEW_HIDE_STYLE_ID;
+        (doc.head || doc.documentElement).appendChild(style);
+    }
+    style.textContent = MINI_PREVIEW_CSS;
+}
+
+function removeHideStyle(doc: Document): void {
+    doc.getElementById(MINI_PREVIEW_HIDE_STYLE_ID)?.remove();
+}
+
+function hideFloatWindowElement(el: Element): void {
+    const win = (el.closest?.('.float-window') as HTMLElement | null) || (el as HTMLElement);
+    if (!win || !win.classList?.contains('float-window')) {
+        // 只动 float-window，避免误伤其它节点
+        const nested = el.querySelector?.('.float-window') as HTMLElement | null;
+        if (!nested) {
+            return;
+        }
+        hideFloatWindowElement(nested);
+        return;
+    }
+    win.setAttribute('hidden', '');
+    win.setAttribute('data-game-preview-suppressed', '1');
+    win.style.setProperty('display', 'none', 'important');
+    win.style.setProperty('visibility', 'hidden', 'important');
+    win.style.setProperty('opacity', '0', 'important');
+    win.style.setProperty('pointer-events', 'none', 'important');
+}
+
+function restoreFloatWindowElement(el: Element): void {
+    const win = (el.classList?.contains('float-window') ? el : el.closest?.('.float-window')) as HTMLElement | null;
+    if (!win || win.getAttribute('data-game-preview-suppressed') !== '1') {
+        return;
+    }
+    win.removeAttribute('hidden');
+    win.removeAttribute('data-game-preview-suppressed');
+    win.style.removeProperty('display');
+    win.style.removeProperty('visibility');
+    win.style.removeProperty('opacity');
+    win.style.removeProperty('pointer-events');
+}
+
+function collectElements(result: HTMLElement[][] | HTMLElement[] | void | null): HTMLElement[] {
+    if (!result || !Array.isArray(result)) {
+        return [];
+    }
+    const list: HTMLElement[] = [];
+    for (const item of result) {
+        if (!item) {
+            continue;
+        }
+        if (Array.isArray(item)) {
+            for (const el of item) {
+                if (el) {
+                    list.push(el);
+                }
+            }
+        } else {
+            list.push(item as HTMLElement);
+        }
+    }
+    return list;
+}
+
+/**
+ * @zh 隐藏/恢复场景面板右下角相机小窗。
+ * 开启游戏预览时 hidden=true；关闭游戏预览时 hidden=false，交还编辑器正常触发。
+ */
+async function setEditorMiniPreviewDomHidden(hidden: boolean): Promise<void> {
+    const docs = getCandidateDocuments();
+
+    if (hidden) {
+        for (const doc of docs) {
+            injectHideStyle(doc);
+        }
+        try {
+            await Editor.Panel.close('scene.preview');
+        } catch {
+            // ignore
+        }
+    } else {
+        for (const doc of docs) {
+            removeHideStyle(doc);
+            doc.querySelectorAll('.float-window[data-game-preview-suppressed="1"]').forEach((node) => {
+                restoreFloatWindowElement(node);
+            });
+        }
+    }
+
+    for (const selector of EDITOR_MINI_SELECTORS) {
+        try {
+            const queried = await Editor.Panel.querySelector('scene', selector);
+            for (const el of collectElements(queried as any)) {
+                try {
+                    const doc = el.ownerDocument;
+                    if (doc) {
+                        if (hidden) {
+                            injectHideStyle(doc);
+                        } else {
+                            removeHideStyle(doc);
+                        }
+                    }
+                } catch {
+                    // ignore
+                }
+                if (hidden) {
+                    hideFloatWindowElement(el);
+                } else {
+                    restoreFloatWindowElement(el);
+                }
+            }
+        } catch {
+            // ignore
+        }
+
+        for (const doc of docs) {
+            doc.querySelectorAll(selector).forEach((node) => {
+                if (hidden) {
+                    hideFloatWindowElement(node);
+                } else {
+                    restoreFloatWindowElement(node);
+                }
+            });
+        }
+    }
+}
 
 // 设备管理器不可用时的兜底列表
 const FALLBACK_DEVICES: IDeviceItem[] = [
@@ -85,6 +258,7 @@ class CameraPreviewPanel {
     private capturing = false;
     private captureTimer = 0;
     private cameraTimer = 0;
+    private miniPreviewHideTimer = 0;
     private stopVersion = 0;
     private readonly onSceneReady = (): void => {
         this.handleSceneReady();
@@ -92,6 +266,18 @@ class CameraPreviewPanel {
     private readonly onSceneClose = (): void => {
         this.handleSceneClose();
     };
+    private readonly onSelectionChange = (): void => {
+        // 选中 Camera 时编辑器会尝试弹小窗；压制 API + DOM 兜底，不影响游戏预览 capture
+        if (this.visible) {
+            void this.setEditorCameraMiniPreviewHidden(true);
+        }
+    };
+
+    private hasPreviewFrame(): boolean {
+        const preview = this.$.preview as HTMLImageElement;
+        const src = preview?.getAttribute?.('src') || '';
+        return !!(src && preview.style.visibility !== 'hidden');
+    }
 
     constructor(elements: Record<string, any>) {
         this.$ = elements;
@@ -103,10 +289,13 @@ class CameraPreviewPanel {
         const message = Editor.Message as any;
         message.addBroadcastListener('scene:ready', this.onSceneReady);
         message.addBroadcastListener('scene:close', this.onSceneClose);
+        message.addBroadcastListener('selection:select', this.onSelectionChange);
         await this.loadSettings();
         this.fillFixedSelects();
         await this.refreshDevices();
         this.syncControls();
+        // 面板打开即隐藏编辑器相机小窗
+        void this.setEditorCameraMiniPreviewHidden(true);
         // 面板可能在场景已就绪后才打开，广播已经错过，主动探测一次
         if (await this.probeSceneReady()) {
             this.handleSceneReady();
@@ -121,7 +310,9 @@ class CameraPreviewPanel {
         const message = Editor.Message as any;
         message.removeBroadcastListener('scene:ready', this.onSceneReady);
         message.removeBroadcastListener('scene:close', this.onSceneClose);
+        message.removeBroadcastListener('selection:select', this.onSelectionChange);
         this.stopPreviewTimers();
+        void this.setEditorCameraMiniPreviewHidden(false);
         void this.stopScene();
     }
 
@@ -129,6 +320,7 @@ class CameraPreviewPanel {
         this.visible = visible;
         if (visible) {
             this.stopVersion++;
+            void this.setEditorCameraMiniPreviewHidden(true);
             if (this.sceneReady) {
                 void this.refreshCameras();
                 void this.capture();
@@ -136,6 +328,7 @@ class CameraPreviewPanel {
                 this.showPlaceholder(translate('waiting_scene'));
             }
         } else {
+            void this.setEditorCameraMiniPreviewHidden(false);
             void this.stopScene();
         }
     }
@@ -145,9 +338,49 @@ class CameraPreviewPanel {
         if (!this.visible) {
             return;
         }
+        void this.setEditorCameraMiniPreviewHidden(true);
         void this.refreshCameras();
         this.restartPreviewTimers();
         void this.capture();
+    }
+
+    /**
+     * @zh 游戏预览开启时隐藏场景右下角相机小窗；关闭预览后恢复显示。
+     * 场景侧拦截 MiniPreview.handleSelect，避免选中 Camera 时打断游戏预览渲染。
+     */
+    private async setEditorCameraMiniPreviewHidden(hidden: boolean): Promise<void> {
+        // 先停掉定时器，避免 close 时又被下一拍重新藏起来
+        window.clearInterval(this.miniPreviewHideTimer);
+        this.miniPreviewHideTimer = 0;
+
+        try {
+            Editor.Message.broadcast('camera-preview:set-mini-hidden', hidden);
+        } catch {
+            // ignore
+        }
+        await setEditorMiniPreviewDomHidden(hidden);
+
+        try {
+            await this.executeSceneScript('setMiniPreviewSuppressed', [hidden]);
+        } catch {
+            // 场景未就绪时忽略，scene:ready 后会再设一次
+        }
+
+        if (hidden && this.visible) {
+            // DOM 兜底：个别版本仍会闪一下小窗；场景侧只做轻量 ensure，不再每帧 destroy
+            this.miniPreviewHideTimer = window.setInterval(() => {
+                if (!this.visible) {
+                    return;
+                }
+                try {
+                    Editor.Message.broadcast('camera-preview:set-mini-hidden', true);
+                } catch {
+                    // ignore
+                }
+                void setEditorMiniPreviewDomHidden(true);
+                void this.executeSceneScript('hideEditorMiniPreview', []).catch(() => {});
+            }, MINI_PREVIEW_HIDE_INTERVAL);
+        }
     }
 
     private handleSceneClose(): void {
@@ -182,8 +415,10 @@ class CameraPreviewPanel {
     private stopPreviewTimers(): void {
         window.clearInterval(this.captureTimer);
         window.clearInterval(this.cameraTimer);
+        window.clearInterval(this.miniPreviewHideTimer);
         this.captureTimer = 0;
         this.cameraTimer = 0;
+        this.miniPreviewHideTimer = 0;
     }
 
     /**
@@ -405,7 +640,10 @@ class CameraPreviewPanel {
                 return;
             }
             if (!result || !result.dataUrl) {
-                this.showPlaceholder(translate('no_camera'));
+                // 选中 Camera 时编辑器可能短暂干扰；已有画面则保留，避免闪成空白
+                if (!this.hasPreviewFrame()) {
+                    this.showPlaceholder(translate('no_camera'));
+                }
                 return;
             }
             this.$.preview.src = result.dataUrl;
@@ -413,7 +651,7 @@ class CameraPreviewPanel {
             this.$.placeholder.textContent = '';
             this.updateStatus(result);
         } catch (error: any) {
-            if (this.visible) {
+            if (this.visible && !this.hasPreviewFrame()) {
                 this.showPlaceholder(error && error.message ? error.message : String(error));
             }
         } finally {

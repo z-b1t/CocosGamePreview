@@ -4,7 +4,7 @@
     "name": "camera-preview",
     "version": "1.0.0",
     "author": "z",
-    "editor": ">=3.8.8",
+    "editor": ">=3.8.7",
     "scripts": {
         "preinstall": "node ./scripts/preinstall.js",
         "build": "npx tsc"
@@ -12,7 +12,7 @@
     "description": "i18n:camera-preview.description",
     "main": "./dist/main.js",
     "devDependencies": {
-        "@cocos/creator-types": "^3.8.8",
+        "@cocos/creator-types": "^3.8.7",
         "@types/node": "^18.17.1",
         "typescript": "^5.8.2"
     },
@@ -45,7 +45,8 @@
             }
         },
         "scene": {
-            "script": "./dist/scene.js"
+            "script": "./dist/scene.js",
+            "custom": "./dist/scene-ui.js"
         }
     }
 }

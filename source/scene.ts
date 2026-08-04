@@ -1,5 +1,5 @@
 import './engine-path';
-import { Camera, Node, RenderTexture, director, renderer } from 'cc';
+import { Camera, Director, Node, RenderTexture, director, gfx, renderer } from 'cc';
 import type { ICameraInfo, ICaptureOptions, ICaptureResult } from './types';
 
 interface IAttachedCamera {
@@ -17,6 +17,11 @@ let attachedCameras: IAttachedCamera[] = [];
 let attachedKey = '';
 
 const EDITOR_CAMERA_NODE_NAMES = new Set(['Editor Scene Background', 'Scene Gizmo Camera']);
+
+function isRendererReady(): boolean {
+    const root = director.root;
+    return !!root?.mainWindow && !!root.pipeline && root.device.swapchainFormat !== gfx.Format.UNKNOWN;
+}
 
 function getSceneCameras(): Camera[] {
     const scene = director.getScene();
@@ -42,12 +47,22 @@ function getNodePath(node: Node): string {
 
 function ensureRenderTexture(width: number, height: number): RenderTexture {
     if (!renderTexture) {
-        renderTexture = new RenderTexture();
-    }
-    if (renderTexture.width !== width || renderTexture.height !== height) {
-        renderTexture.reset({ width, height });
+        const texture = new RenderTexture();
+        texture.reset({ width, height });
+        renderTexture = texture;
+    } else if (renderTexture.width !== width || renderTexture.height !== height) {
+        // reset 会销毁并重建底层 RenderWindow；相机仍挂载时可能产生无附件的 Framebuffer。
+        renderTexture.resize(width, height);
     }
     return renderTexture;
+}
+
+function destroyRenderTexture(): void {
+    if (!renderTexture) {
+        return;
+    }
+    renderTexture.destroy();
+    renderTexture = null;
 }
 
 function ensureEncodeCanvas(width: number, height: number): HTMLCanvasElement {
@@ -158,7 +173,11 @@ export const methods = {
         }));
     },
 
-    capture(options: ICaptureOptions): ICaptureResult | null {
+    async capture(options: ICaptureOptions): Promise<ICaptureResult | null> {
+        // scene:ready 可能早于编辑器交换链和渲染管线就绪，过早创建 RenderTexture 会得到无附件的 Framebuffer。
+        if (!isRendererReady()) {
+            return null;
+        }
         const width = Math.max(1, Math.round(options.width));
         const height = Math.max(1, Math.round(options.height));
         const cameras = getSceneCameras();
@@ -181,7 +200,10 @@ export const methods = {
         const texture = ensureRenderTexture(width, height);
         const key = `${options.mode}|${width}x${height}|${targets.map((camera) => camera.node.uuid).join(',')}`;
         ensureAttached(targets, texture, key);
-        requestRepaint();
+        await new Promise<void>((resolve) => {
+            director.once(Director.EVENT_AFTER_DRAW, resolve);
+            requestRepaint();
+        });
 
         const pixels = new Uint8Array(width * height * 4);
         texture.readPixels(0, 0, width, height, pixels);
@@ -195,6 +217,7 @@ export const methods = {
 
     stop(): void {
         detachCameras();
+        destroyRenderTexture();
     },
 };
 
@@ -202,9 +225,6 @@ export function load() {}
 
 export function unload() {
     detachCameras();
-    if (renderTexture) {
-        renderTexture.destroy();
-        renderTexture = null;
-    }
+    destroyRenderTexture();
     encodeCanvas = null;
 }

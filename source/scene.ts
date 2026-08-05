@@ -4,8 +4,15 @@ import type { ICameraInfo, ICaptureOptions, ICaptureResult } from './types';
 
 let renderTexture: RenderTexture | null = null;
 let encodeCanvas: HTMLCanvasElement | null = null;
+let encodeImageData: ImageData | null = null;
+let pixelBuffer: Uint8Array | null = null;
+/** 上一帧像素副本，用于跳过无变化时的 JPEG 编码与 IPC。 */
+let lastFramePixels: Uint8Array | null = null;
 /** 仅用于预览的临时相机节点，绝不改动场景里原有 Camera 的渲染目标。 */
 let previewNodes: Node[] = [];
+/** 与 previewNodes 一一对应的源相机 uuid，用于判断是否需要重建。 */
+let previewSourceUuids: string[] = [];
+let healThrottleUntil = 0;
 
 const EDITOR_CAMERA_NODE_NAMES = new Set(['Editor Scene Background', 'Scene Gizmo Camera']);
 const PREVIEW_NODE_NAME = '__CameraPreviewProxy__';
@@ -57,7 +64,6 @@ function getSceneCameras(): Camera[] {
             if (EDITOR_CAMERA_NODE_NAMES.has(camera.node.name)) {
                 return false;
             }
-            // 跳过本插件自己的临时预览相机
             if (camera.node.name === PREVIEW_NODE_NAME) {
                 return false;
             }
@@ -75,6 +81,18 @@ function getNodePath(node: Node): string {
     return names.join('/');
 }
 
+function setPreviewCamerasEnabled(enabled: boolean): void {
+    for (const node of previewNodes) {
+        if (!node.isValid) {
+            continue;
+        }
+        const camera = node.getComponent(Camera);
+        if (camera) {
+            camera.enabled = enabled;
+        }
+    }
+}
+
 function destroyPreviewCameras(): void {
     for (const node of previewNodes) {
         try {
@@ -90,6 +108,7 @@ function destroyPreviewCameras(): void {
         }
     }
     previewNodes = [];
+    previewSourceUuids = [];
 }
 
 function ensureRenderTexture(width: number, height: number): RenderTexture {
@@ -98,7 +117,6 @@ function ensureRenderTexture(width: number, height: number): RenderTexture {
         texture.reset({ width, height });
         renderTexture = texture;
     } else if (renderTexture.width !== width || renderTexture.height !== height) {
-        // 先拆掉预览相机，避免 resize 时仍挂在旧 Framebuffer 上
         destroyPreviewCameras();
         renderTexture.resize(width, height);
     }
@@ -121,8 +139,16 @@ function ensureEncodeCanvas(width: number, height: number): HTMLCanvasElement {
     if (encodeCanvas.width !== width || encodeCanvas.height !== height) {
         encodeCanvas.width = width;
         encodeCanvas.height = height;
+        encodeImageData = null;
     }
     return encodeCanvas;
+}
+
+function ensurePixelBuffer(size: number): Uint8Array {
+    if (!pixelBuffer || pixelBuffer.length !== size) {
+        pixelBuffer = new Uint8Array(size);
+    }
+    return pixelBuffer;
 }
 
 function copyCameraSettings(source: Camera, target: Camera): void {
@@ -145,6 +171,18 @@ function copyCameraSettings(source: Camera, target: Camera): void {
     target.rect = new Rect(rect.x, rect.y, rect.width, rect.height);
 }
 
+function syncProxyNode(source: Camera, node: Node): void {
+    node.layer = source.node.layer;
+    node.setWorldPosition(source.node.worldPosition);
+    node.setWorldRotation(source.node.worldRotation);
+    node.setWorldScale(source.node.worldScale);
+    const camera = node.getComponent(Camera);
+    if (camera) {
+        copyCameraSettings(source, camera);
+        camera.targetTexture = renderTexture;
+    }
+}
+
 /**
  * @zh 创建与源相机同姿态/同参数的临时 Camera，只把它们的 targetTexture 指到预览贴图。
  * 这样完全不调用场景相机的 changeTargetWindow，编辑器相机小窗不会被抢走。
@@ -161,7 +199,6 @@ function createPreviewCameras(sources: Camera[], texture: RenderTexture): number
             continue;
         }
         const node = new Node(PREVIEW_NODE_NAME);
-        // 不进层级、不进存档，避免污染场景资源
         node.hideFlags |= CCObject.Flags.DontSave | CCObject.Flags.HideInHierarchy;
         node.layer = source.node.layer;
         scene.addChild(node);
@@ -171,11 +208,48 @@ function createPreviewCameras(sources: Camera[], texture: RenderTexture): number
 
         const camera = node.addComponent(Camera);
         copyCameraSettings(source, camera);
-        // 走组件官方路径绑定 RenderTexture，只影响这个临时相机
         camera.targetTexture = texture;
+        camera.enabled = false;
         previewNodes.push(node);
+        previewSourceUuids.push(source.node.uuid);
     }
     return previewNodes.length;
+}
+
+function sourceListMatches(sources: Camera[]): boolean {
+    if (sources.length !== previewSourceUuids.length || sources.length !== previewNodes.length) {
+        return false;
+    }
+    for (let i = 0; i < sources.length; i++) {
+        if (!sources[i].isValid || sources[i].node.uuid !== previewSourceUuids[i]) {
+            return false;
+        }
+        if (!previewNodes[i]?.isValid) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function ensurePreviewCameras(sources: Camera[], texture: RenderTexture): number {
+    if (sourceListMatches(sources)) {
+        for (let i = 0; i < sources.length; i++) {
+            syncProxyNode(sources[i], previewNodes[i]);
+        }
+        return previewNodes.length;
+    }
+    return createPreviewCameras(sources, texture);
+}
+
+function resolveTargets(options: ICaptureOptions): Camera[] {
+    const cameras = getSceneCameras();
+    if (options.mode === 'single') {
+        const target = cameras.find((camera) => camera.node.uuid === options.cameraUuid);
+        return target ? [target] : [];
+    }
+    return cameras
+        .filter((camera) => camera.enabledInHierarchy && !camera.targetTexture)
+        .sort((a, b) => a.priority - b.priority);
 }
 
 function requestRepaint(): void {
@@ -252,7 +326,6 @@ function patchMiniPreview(mini: any): void {
         handleSelect: originalHandleSelect,
         createPreviewNode: originalCreatePreviewNode,
     };
-    // 仍记录选中 uuid，但不创建小窗预览相机，避免和游戏预览抢渲染
     mini.handleSelect = (uuid: string) => {
         if (uuid) {
             suppressedSelectUuid = uuid;
@@ -322,14 +395,57 @@ function encodeToDataUrl(pixels: Uint8Array, width: number, height: number, qual
     if (!context) {
         return '';
     }
-    const imageData = context.createImageData(width, height);
+    if (!encodeImageData || encodeImageData.width !== width || encodeImageData.height !== height) {
+        encodeImageData = context.createImageData(width, height);
+    }
+    const imageData = encodeImageData;
     const rowBytes = width * 4;
+    const dst = imageData.data;
     for (let row = 0; row < height; row++) {
         const start = (height - row - 1) * rowBytes;
-        imageData.data.set(pixels.subarray(start, start + rowBytes), row * rowBytes);
+        dst.set(pixels.subarray(start, start + rowBytes), row * rowBytes);
     }
     context.putImageData(imageData, 0, 0);
     return canvas.toDataURL('image/jpeg', quality);
+}
+
+function pixelsUnchanged(pixels: Uint8Array): boolean {
+    if (!lastFramePixels || lastFramePixels.length !== pixels.length) {
+        return false;
+    }
+    const prev = lastFramePixels;
+    // 8MB 量级逐字节比较远比 JPEG 编码便宜
+    for (let i = 0; i < pixels.length; i++) {
+        if (pixels[i] !== prev[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function rememberFramePixels(pixels: Uint8Array): void {
+    if (!lastFramePixels || lastFramePixels.length !== pixels.length) {
+        lastFramePixels = new Uint8Array(pixels.length);
+    }
+    lastFramePixels.set(pixels);
+}
+
+function maybeHealGameCameras(): void {
+    const now = Date.now();
+    if (now < healThrottleUntil) {
+        return;
+    }
+    healThrottleUntil = now + 2000;
+    healGameCameraWindows();
+}
+
+function clearSession(): void {
+    setPreviewCamerasEnabled(false);
+    destroyPreviewCameras();
+    destroyRenderTexture();
+    pixelBuffer = null;
+    lastFramePixels = null;
+    encodeImageData = null;
 }
 
 export const methods = {
@@ -355,28 +471,20 @@ export const methods = {
         hideEditorMiniPreview();
     },
 
+    /**
+     * @zh 常驻代理相机 + 单次 repaint 读回。帧间禁用代理相机，避免拖拽场景时每帧多画一路。
+     */
     async capture(options: ICaptureOptions): Promise<ICaptureResult | null> {
         if (!isRendererReady()) {
             return null;
         }
-        // 兼容旧逻辑可能留下的 window=null 相机
-        healGameCameraWindows();
+        maybeHealGameCameras();
 
         const width = Math.max(1, Math.round(options.width));
         const height = Math.max(1, Math.round(options.height));
-        const cameras = getSceneCameras();
-
-        let targets: Camera[];
-        if (options.mode === 'single') {
-            const target = cameras.find((camera) => camera.node.uuid === options.cameraUuid);
-            targets = target ? [target] : [];
-        } else {
-            targets = cameras
-                .filter((camera) => camera.enabledInHierarchy && !camera.targetTexture)
-                .sort((a, b) => a.priority - b.priority);
-        }
+        const targets = resolveTargets(options);
         if (targets.length === 0) {
-            destroyPreviewCameras();
+            clearSession();
             return null;
         }
 
@@ -385,19 +493,32 @@ export const methods = {
             return null;
         }
 
-        const cameraCount = createPreviewCameras(targets, texture);
+        const cameraCount = ensurePreviewCameras(targets, texture);
         if (cameraCount === 0) {
             return null;
         }
 
+        setPreviewCamerasEnabled(true);
         try {
             await new Promise<void>((resolve) => {
                 director.once(Director.EVENT_AFTER_DRAW, resolve);
                 requestRepaint();
             });
 
-            const pixels = new Uint8Array(width * height * 4);
+            const pixels = ensurePixelBuffer(width * height * 4);
             texture.readPixels(0, 0, width, height, pixels);
+
+            // 场景静止时跳过 JPEG + 大字符串 IPC（CPU 大头），GPU 读回仍保留以保证内容变更能检出
+            if (pixelsUnchanged(pixels)) {
+                return {
+                    unchanged: true,
+                    width,
+                    height,
+                    cameraCount,
+                };
+            }
+            rememberFramePixels(pixels);
+
             return {
                 dataUrl: encodeToDataUrl(pixels, width, height, options.quality),
                 width,
@@ -405,16 +526,13 @@ export const methods = {
                 cameraCount,
             };
         } finally {
-            destroyPreviewCameras();
-            // 再补一次，确保编辑器侧相机窗口状态干净
-            healGameCameraWindows();
-            requestRepaint();
+            // 帧间关掉代理相机，不销毁；不再二次 repaint，避免拖死场景编辑器
+            setPreviewCamerasEnabled(false);
         }
     },
 
     stop(): void {
-        destroyPreviewCameras();
-        destroyRenderTexture();
+        clearSession();
         healGameCameraWindows();
         requestRepaint();
     },
@@ -426,8 +544,7 @@ export function load() {
 
 export function unload() {
     setEditorMiniPreviewSuppressed(false);
-    destroyPreviewCameras();
-    destroyRenderTexture();
+    clearSession();
     healGameCameraWindows();
     encodeCanvas = null;
 }

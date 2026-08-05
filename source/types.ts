@@ -21,7 +21,10 @@ export interface ICaptureOptions {
 }
 
 export interface ICaptureResult {
-    dataUrl: string;
+    /** 画面有变化时才带图；unchanged 时省略以省 IPC。 */
+    dataUrl?: string;
+    /** 与上一帧像素一致，跳过 JPEG/IPC。 */
+    unchanged?: boolean;
     width: number;
     height: number;
     cameraCount: number;

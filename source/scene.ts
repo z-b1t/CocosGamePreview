@@ -13,9 +13,16 @@ let previewNodes: Node[] = [];
 /** 与 previewNodes 一一对应的源相机 uuid，用于判断是否需要重建。 */
 let previewSourceUuids: string[] = [];
 let healThrottleUntil = 0;
+/** 递增后作废进行中的 capture，避免切到无相机场景时仍等待绘制。 */
+let captureGeneration = 0;
+let settleDrawWait: (() => void) | null = null;
 
-const EDITOR_CAMERA_NODE_NAMES = new Set(['Editor Scene Background', 'Scene Gizmo Camera']);
+const EDITOR_CAMERA_NODE_NAMES = new Set(['Editor Camera', 'Editor Scene Background', 'Scene Gizmo Camera']);
 const PREVIEW_NODE_NAME = '__CameraPreviewProxy__';
+/** 编辑器把内置相机挂在这个隐藏根下；预制体隔离场景里路径会显示成 should_hide_in_hierarchy/Camera。 */
+const EDITOR_HIDDEN_ROOT_NAME = 'should_hide_in_hierarchy';
+/** 等不到 AFTER_DRAW 时的上限，防止预制体等无相机场景把 capture 卡住。 */
+const DRAW_WAIT_TIMEOUT_MS = 1000;
 
 function isRendererReady(): boolean {
     const root = director.root;
@@ -53,22 +60,49 @@ function healGameCameraWindows(): void {
     }
 }
 
+/**
+ * @zh 只排除编辑器内置相机。编辑期用户相机的 cameraUsage 也是 EDITOR，不能拿 usage 判断。
+ */
+function isUnderEditorHiddenRoot(node: Node): boolean {
+    let current: Node | null = node;
+    while (current) {
+        if (current.name === EDITOR_HIDDEN_ROOT_NAME) {
+            return true;
+        }
+        current = current.parent;
+    }
+    return false;
+}
+
+function isUserGameCamera(camera: Camera): boolean {
+    if (!camera.isValid || !camera.node?.isValid) {
+        return false;
+    }
+    if (camera.node.name === PREVIEW_NODE_NAME) {
+        return false;
+    }
+    if (EDITOR_CAMERA_NODE_NAMES.has(camera.node.name) || camera.node.name.startsWith('Editor')) {
+        return false;
+    }
+    if (camera.node.hideFlags & CCObject.Flags.HideInHierarchy) {
+        return false;
+    }
+    if (isUnderEditorHiddenRoot(camera.node)) {
+        return false;
+    }
+    return true;
+}
+
 function getSceneCameras(): Camera[] {
     const scene = director.getScene();
     if (!scene) {
         return [];
     }
-    return scene
-        .getComponentsInChildren(Camera)
-        .filter((camera) => {
-            if (EDITOR_CAMERA_NODE_NAMES.has(camera.node.name)) {
-                return false;
-            }
-            if (camera.node.name === PREVIEW_NODE_NAME) {
-                return false;
-            }
-            return true;
-        });
+    return scene.getComponentsInChildren(Camera).filter(isUserGameCamera);
+}
+
+function hasPreviewSession(): boolean {
+    return previewNodes.length > 0 || !!renderTexture;
 }
 
 function getNodePath(node: Node): string {
@@ -99,6 +133,7 @@ function destroyPreviewCameras(): void {
             if (node.isValid) {
                 const camera = node.getComponent(Camera);
                 if (camera) {
+                    camera.enabled = false;
                     camera.targetTexture = null;
                 }
                 node.destroy();
@@ -201,6 +236,7 @@ function createPreviewCameras(sources: Camera[], texture: RenderTexture): number
         const node = new Node(PREVIEW_NODE_NAME);
         node.hideFlags |= CCObject.Flags.DontSave | CCObject.Flags.HideInHierarchy;
         node.layer = source.node.layer;
+        node.active = false;
         scene.addChild(node);
         node.setWorldPosition(source.node.worldPosition);
         node.setWorldRotation(source.node.worldRotation);
@@ -210,6 +246,7 @@ function createPreviewCameras(sources: Camera[], texture: RenderTexture): number
         copyCameraSettings(source, camera);
         camera.targetTexture = texture;
         camera.enabled = false;
+        node.active = true;
         previewNodes.push(node);
         previewSourceUuids.push(source.node.uuid);
     }
@@ -255,6 +292,37 @@ function resolveTargets(options: ICaptureOptions): Camera[] {
 function requestRepaint(): void {
     const editorScene = (globalThis as any).cce;
     editorScene?.Engine?.repaintInEditMode?.();
+}
+
+function waitForDraw(): Promise<boolean> {
+    return new Promise((resolve) => {
+        let settled = false;
+        const finish = (drawn: boolean) => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            settleDrawWait = null;
+            director.off(Director.EVENT_AFTER_DRAW, onDraw);
+            resolve(drawn);
+        };
+        const onDraw = () => finish(true);
+        settleDrawWait = () => finish(false);
+        director.once(Director.EVENT_AFTER_DRAW, onDraw);
+        try {
+            requestRepaint();
+        } catch {
+            finish(false);
+            return;
+        }
+        setTimeout(() => finish(false), DRAW_WAIT_TIMEOUT_MS);
+    });
+}
+
+function onSceneWillChange(): void {
+    captureGeneration += 1;
+    settleDrawWait?.();
+    clearSession();
 }
 
 const MINI_PREVIEW_PATCH_KEY = '__gamePreviewMiniPatch__';
@@ -478,15 +546,18 @@ export const methods = {
         if (!isRendererReady()) {
             return null;
         }
-        maybeHealGameCameras();
 
         const width = Math.max(1, Math.round(options.width));
         const height = Math.max(1, Math.round(options.height));
         const targets = resolveTargets(options);
         if (targets.length === 0) {
-            clearSession();
-            return null;
+            if (hasPreviewSession()) {
+                clearSession();
+            }
+            return { width, height, cameraCount: 0 };
         }
+
+        maybeHealGameCameras();
 
         const texture = ensureRenderTexture(width, height);
         if (!texture.window) {
@@ -495,15 +566,16 @@ export const methods = {
 
         const cameraCount = ensurePreviewCameras(targets, texture);
         if (cameraCount === 0) {
-            return null;
+            return { width, height, cameraCount: 0 };
         }
 
+        const token = ++captureGeneration;
         setPreviewCamerasEnabled(true);
         try {
-            await new Promise<void>((resolve) => {
-                director.once(Director.EVENT_AFTER_DRAW, resolve);
-                requestRepaint();
-            });
+            const drawn = await waitForDraw();
+            if (!drawn || token !== captureGeneration) {
+                return null;
+            }
 
             const pixels = ensurePixelBuffer(width * height * 4);
             texture.readPixels(0, 0, width, height, pixels);
@@ -526,23 +598,35 @@ export const methods = {
                 cameraCount,
             };
         } finally {
-            // 帧间关掉代理相机，不销毁；不再二次 repaint，避免拖死场景编辑器
-            setPreviewCamerasEnabled(false);
+            if (token === captureGeneration) {
+                setPreviewCamerasEnabled(false);
+            }
         }
     },
 
     stop(): void {
+        captureGeneration += 1;
+        settleDrawWait?.();
         clearSession();
+        if (getSceneCameras().length === 0 || !isRendererReady()) {
+            return;
+        }
         healGameCameraWindows();
         requestRepaint();
     },
 };
 
 export function load() {
+    director.on(Director.EVENT_BEFORE_SCENE_LOADING, onSceneWillChange);
+    director.on(Director.EVENT_BEFORE_SCENE_LAUNCH, onSceneWillChange);
     healGameCameraWindows();
 }
 
 export function unload() {
+    director.off(Director.EVENT_BEFORE_SCENE_LOADING, onSceneWillChange);
+    director.off(Director.EVENT_BEFORE_SCENE_LAUNCH, onSceneWillChange);
+    captureGeneration += 1;
+    settleDrawWait?.();
     setEditorMiniPreviewSuppressed(false);
     clearSession();
     healGameCameraWindows();

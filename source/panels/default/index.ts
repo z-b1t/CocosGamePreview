@@ -547,6 +547,15 @@ class CameraPreviewPanel {
             return;
         }
 
+        if (cameras.length === 0) {
+            this.$.cameraSelect.innerHTML = '';
+            this.settings.cameraUuid = '';
+            if (this.visible) {
+                this.showPlaceholder(translate('no_camera'));
+            }
+            return;
+        }
+
         this.$.cameraSelect.innerHTML = cameras
             .map((camera) => {
                 const suffix = camera.enabled ? '' : ` (${translate('disabled')})`;
@@ -640,9 +649,10 @@ class CameraPreviewPanel {
                 return;
             }
             if (!result) {
-                if (!this.hasPreviewFrame()) {
-                    this.showPlaceholder(translate('no_camera'));
-                }
+                return;
+            }
+            if (!result.cameraCount) {
+                this.showPlaceholder(translate('no_camera'));
                 return;
             }
             if (result.unchanged) {
